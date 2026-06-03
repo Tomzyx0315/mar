@@ -17,7 +17,7 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.loader import CachedFolder
 
 from models.vae import AutoencoderKL
-from models import mar
+from models import mar, nextstep_ar
 from engine_mar import train_one_epoch, evaluate
 import copy
 
@@ -189,7 +189,11 @@ def main(args):
     for param in vae.parameters():
         param.requires_grad = False
 
-    model = mar.__dict__[args.model](
+    model_zoo = {}
+    model_zoo.update(mar.__dict__)
+    model_zoo.update(nextstep_ar.__dict__)
+
+    model = model_zoo[args.model](
         img_size=args.img_size,
         vae_stride=args.vae_stride,
         patch_size=args.patch_size,

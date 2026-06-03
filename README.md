@@ -99,6 +99,7 @@ main_mar.py \
 --output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
 --data_path ${IMAGENET_PATH}
 ```
+- To train a pure raster-order autoregressive continuous-token variant inspired by NextStep-1 while keeping the MAR tokenizer, DiffLoss head, class conditioning, optimizer, and model scales, replace `--model mar_large` with `--model nextstep_ar_large`. The corresponding model names are `nextstep_ar_base`, `nextstep_ar_large`, and `nextstep_ar_huge`.
 - Training time is ~1d7h on 32 H100 GPUs with `--batch_size 64`.
 - Add `--online_eval` to evaluate FID during training (every 40 epochs).
 - (Optional) To train with cached VAE latents, add `--use_cached --cached_path ${CACHED_PATH}` to the arguments. 
