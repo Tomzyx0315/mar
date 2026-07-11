@@ -12,6 +12,7 @@ import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from distill_dmd.tar_dataset import ImageNetTarDataset, MarTrainTransform
 from distill_dmd.mar_dmd import (
     compute_cfg_scale,
     compute_fake_loss,
@@ -60,6 +61,7 @@ def get_args_parser():
     parser.add_argument("--preview_class_labels", default="", type=str)
 
     parser.add_argument("--data_path", default="./data/imagenet", type=str)
+    parser.add_argument("--tar_index_path", default="", type=str)
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--seed", default=1, type=int)
 
@@ -259,13 +261,21 @@ def main(args):
         os.makedirs(args.output_dir, exist_ok=True)
     print("{}".format(args).replace(", ", ",\n"))
 
-    transform_train = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-    ])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=transform_train)
+    if args.data_path.endswith(".tar"):
+        dataset_train = ImageNetTarDataset(
+            args.data_path,
+            transform=MarTrainTransform(args.img_size),
+            index_path=args.tar_index_path,
+        )
+    else:
+        transform_train = transforms.Compose([
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+        dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=transform_train)
+    print(dataset_train)
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train,
         num_replicas=misc.get_world_size(),

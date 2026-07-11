@@ -29,13 +29,23 @@ learns the score of the generator's current fake-token distribution.
 
 Use the same environment and data layout as the MAR repo.
 
-1. Prepare ImageNet with the standard `ImageFolder` layout:
+1. Prepare ImageNet. The distillation script supports either the standard
+   extracted `ImageFolder` layout:
 
 ```text
 ${IMAGENET_PATH}/train/<class_name>/*.JPEG
 ```
 
-Only the training split is used for distillation.
+or the original ImageNet training tar without decompression:
+
+```text
+${IMAGENET_PATH}/ILSVRC2012_img_train.tar
+```
+
+Only the training split is used for distillation. When a `.tar` path is passed
+to `--data_path`, the script builds an offset index at
+`${data_path}.index` on the first run, then reads images by seeking into the tar.
+You can put the index somewhere else with `--tar_index_path`.
 
 2. Download the KL-16 VAE checkpoint and the MAR teacher checkpoint:
 
@@ -70,7 +80,8 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
   -m distill_dmd.train_mar_dmd \
   --teacher_ckpt pretrained_models/mar/mar_large/checkpoint-last.pth \
   --vae_path pretrained_models/vae/kl16.ckpt \
-  --data_path ${IMAGENET_PATH} \
+  --data_path ${IMAGENET_PATH}/ILSVRC2012_img_train.tar \
+  --tar_index_path ${IMAGENET_PATH}/ILSVRC2012_img_train.tar.index \
   --output_dir output_mar_dmd/mar_large_cfg3 \
   --batch_size 64 \
   --train_iters 100000 \
