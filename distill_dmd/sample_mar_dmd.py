@@ -8,12 +8,17 @@ from PIL import Image
 import torch
 
 from distill_dmd.mar_dmd import (
+    DEFAULT_CONDITIONING_TIMESTEP,
     create_dmd_heads,
     sample_tokens_one_step,
     unwrap_model,
 )
-from distill_dmd.train_mar_dmd import fill_from_teacher_args, load_checkpoint, build_teacher_model
-from models.vae import AutoencoderKL
+from distill_dmd.train_mar_dmd import (
+    build_teacher_model,
+    build_vae,
+    fill_from_teacher_args,
+    load_checkpoint,
+)
 
 
 def get_args_parser():
@@ -28,6 +33,8 @@ def get_args_parser():
     parser.add_argument("--cfg", default=None, type=float)
     parser.add_argument("--cfg_schedule", default=None, choices=["linear", "constant"])
     parser.add_argument("--temperature", default=1.0, type=float)
+    parser.add_argument("--conditioning_timestep", default=None, type=int)
+    parser.add_argument("--use_raw_generator", action="store_true")
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--class_labels", default="", type=str)
     parser.add_argument("--device", default="cuda", type=str)
@@ -74,18 +81,21 @@ def main(args):
     dmd_path = args.dmd_ckpt
     if os.path.isdir(dmd_path):
         dmd_path = os.path.join(dmd_path, "checkpoint-last.pth")
-    dmd_ckpt = torch.load(dmd_path, map_location="cpu")
-    unwrap_model(generator_head).load_state_dict(dmd_ckpt["generator_head"], strict=True)
-    generator_head.to(device).eval()
+    dmd_ckpt = load_checkpoint(dmd_path)
     train_args = dmd_ckpt.get("args", None)
+    generator_key = "generator_head" if args.use_raw_generator else "generator_head_ema"
+    if generator_key not in dmd_ckpt:
+        generator_key = "generator_head"
+    unwrap_model(generator_head).load_state_dict(dmd_ckpt[generator_key], strict=True)
+    generator_head.to(device).eval()
     if args.cfg is None:
         args.cfg = getattr(train_args, "cfg", 3.0)
     if args.cfg_schedule is None:
         args.cfg_schedule = getattr(train_args, "cfg_schedule", "linear")
+    if args.conditioning_timestep is None:
+        args.conditioning_timestep = getattr(train_args, "conditioning_timestep", DEFAULT_CONDITIONING_TIMESTEP)
 
-    vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path)
-    vae.to(device).eval()
-    vae.requires_grad_(False)
+    vae = build_vae(args, device)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,6 +127,7 @@ def main(args):
             cfg=args.cfg,
             cfg_schedule=args.cfg_schedule,
             temperature=args.temperature,
+            conditioning_timestep=args.conditioning_timestep,
             progress=False,
         )
         sampled_images = vae.decode(sampled_tokens / 0.2325)

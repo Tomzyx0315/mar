@@ -5,9 +5,10 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
-CONDITIONING_TIMESTEP = 999
+DEFAULT_CONDITIONING_TIMESTEP = 899
 
 
 def unwrap_model(model):
@@ -51,6 +52,24 @@ class CfgConditionedHead(nn.Module):
         return self.base(x, t, c)
 
 
+class TokenGanClassifier(nn.Module):
+    """Shared conditional token discriminator branch."""
+
+    def __init__(self, model_channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(model_channels),
+            nn.Linear(model_channels, model_channels),
+            nn.SiLU(),
+            nn.Linear(model_channels, 1),
+        )
+        nn.init.normal_(self.net[-1].weight, std=0.02)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, hidden):
+        return self.net(hidden).squeeze(-1)
+
+
 def create_dmd_heads(teacher_model):
     """Create trainable generator/fake heads from the teacher diffusion head."""
     teacher_head = teacher_model.diffloss.net
@@ -60,6 +79,10 @@ def create_dmd_heads(teacher_model):
     generator_head.requires_grad_(True)
     fake_head.requires_grad_(True)
     return generator_head, fake_head, teacher_head
+
+
+def create_token_gan_classifier(teacher_model):
+    return TokenGanClassifier(teacher_model.diffloss.net.model_channels)
 
 
 def sample_orders(batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -137,7 +160,7 @@ def extract_eps(model_output: torch.Tensor, token_dim: int) -> torch.Tensor:
 
 
 def predict_xstart_from_eps(diffusion, x_t: torch.Tensor, t: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
-    return diffusion._predict_xstart_from_eps(x_t=x_t, t=t, eps=eps)
+    return diffusion._predict_xstart_from_eps(x_t=x_t.float(), t=t, eps=eps.float())
 
 
 def one_step_generate(
@@ -147,17 +170,76 @@ def one_step_generate(
     token_dim: int,
     cfg_scale=None,
     temperature: float = 1.0,
+    conditioning_timestep: int = DEFAULT_CONDITIONING_TIMESTEP,
 ) -> torch.Tensor:
-    noise = torch.randn(cond.shape[0], token_dim, device=cond.device, dtype=cond.dtype) * temperature
+    cond = cond.float()
+    noise = torch.randn(cond.shape[0], token_dim, device=cond.device, dtype=torch.float32) * temperature
     timesteps = torch.full(
         (cond.shape[0],),
-        CONDITIONING_TIMESTEP,
+        conditioning_timestep,
         device=cond.device,
         dtype=torch.long,
     )
     model_output = generator_head(noise, timesteps, cond, cfg_scale=cfg_scale)
-    eps = extract_eps(model_output, token_dim)
-    return predict_xstart_from_eps(diffusion, noise, timesteps, eps).float()
+    eps = extract_eps(model_output.float(), token_dim)
+    return predict_xstart_from_eps(diffusion, noise, timesteps, eps)
+
+
+def diffusion_head_hidden(diffusion_head, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """Run MAR's DiffLoss MLP up to the final hidden token feature."""
+    diffusion_head = unwrap_model(diffusion_head)
+    x = diffusion_head.input_proj(x.float())
+    t = diffusion_head.time_embed(t)
+    c = diffusion_head.cond_embed(c.float())
+    y = t + c
+
+    if diffusion_head.grad_checkpointing and not torch.jit.is_scripting():
+        for block in diffusion_head.res_blocks:
+            x = checkpoint(block, x, y)
+    else:
+        for block in diffusion_head.res_blocks:
+            x = block(x, y)
+    return x
+
+
+def diffusion_gan_timesteps(
+    diffusion,
+    batch_size: int,
+    device: torch.device,
+    enabled: bool,
+    max_timestep: int = 0,
+) -> torch.Tensor:
+    if not enabled:
+        return torch.zeros(batch_size, device=device, dtype=torch.long)
+    high = diffusion.num_timesteps if max_timestep <= 0 else min(max_timestep, diffusion.num_timesteps)
+    if high <= 0:
+        raise ValueError(f"diffusion_gan_max_timestep must be positive, got {max_timestep}")
+    return torch.randint(0, high, (batch_size,), device=device, dtype=torch.long)
+
+
+def compute_token_gan_logits(
+    fake_head,
+    gan_classifier,
+    diffusion,
+    tokens: torch.Tensor,
+    cond: torch.Tensor,
+    diffusion_gan: bool = False,
+    diffusion_gan_max_timestep: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    timesteps = diffusion_gan_timesteps(
+        diffusion,
+        tokens.shape[0],
+        tokens.device,
+        diffusion_gan,
+        diffusion_gan_max_timestep,
+    )
+    if diffusion_gan:
+        noisy_tokens = diffusion.q_sample(tokens.float(), timesteps, noise=torch.randn_like(tokens.float()))
+    else:
+        noisy_tokens = tokens.float()
+    hidden = diffusion_head_hidden(fake_head, noisy_tokens, timesteps, cond)
+    logits = gan_classifier(hidden.float())
+    return logits, timesteps
 
 
 def compute_cfg_scale(base_cfg: float, cfg_schedule: str, visible_fraction: torch.Tensor) -> torch.Tensor:
@@ -168,8 +250,8 @@ def compute_cfg_scale(base_cfg: float, cfg_schedule: str, visible_fraction: torc
     raise NotImplementedError(f"Unknown cfg_schedule: {cfg_schedule}")
 
 
-def compute_generator_dmd_loss(
-    generator_head,
+def compute_generator_dmd_loss_from_tokens(
+    x_gen: torch.Tensor,
     fake_head,
     teacher_head,
     diffusion,
@@ -179,17 +261,7 @@ def compute_generator_dmd_loss(
     cfg_scale: torch.Tensor,
     min_step: int,
     max_step: int,
-    temperature: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    x_gen = one_step_generate(
-        generator_head,
-        diffusion,
-        cond,
-        token_dim,
-        cfg_scale=cfg_scale,
-        temperature=temperature,
-    )
-
     timesteps = torch.randint(
         min_step,
         max_step + 1,
@@ -201,12 +273,15 @@ def compute_generator_dmd_loss(
     x_t = diffusion.q_sample(x_gen, timesteps, noise=noise)
 
     with torch.no_grad():
-        fake_eps = extract_eps(fake_head(x_t, timesteps, cond), token_dim)
-        real_cond_eps = extract_eps(teacher_head(x_t, timesteps, cond), token_dim)
+        x_t = x_t.float()
+        cond = cond.float()
+        uncond_cond = uncond_cond.float()
+        fake_eps = extract_eps(fake_head(x_t, timesteps, cond).float(), token_dim)
+        real_cond_eps = extract_eps(teacher_head(x_t, timesteps, cond).float(), token_dim)
         if float(cfg_scale.detach().mean().item()) == 1.0:
             real_eps = real_cond_eps
         else:
-            real_uncond_eps = extract_eps(teacher_head(x_t, timesteps, uncond_cond), token_dim)
+            real_uncond_eps = extract_eps(teacher_head(x_t, timesteps, uncond_cond).float(), token_dim)
             real_eps = real_uncond_eps + cfg_scale * (real_cond_eps - real_uncond_eps)
 
         pred_fake_x0 = predict_xstart_from_eps(diffusion, x_t, timesteps, fake_eps)
@@ -228,6 +303,66 @@ def compute_generator_dmd_loss(
     return loss, logs
 
 
+def compute_generator_dmd_loss(
+    generator_head,
+    fake_head,
+    teacher_head,
+    diffusion,
+    cond: torch.Tensor,
+    uncond_cond: torch.Tensor,
+    token_dim: int,
+    cfg_scale: torch.Tensor,
+    min_step: int,
+    max_step: int,
+    temperature: float = 1.0,
+    conditioning_timestep: int = DEFAULT_CONDITIONING_TIMESTEP,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    x_gen = one_step_generate(
+        generator_head,
+        diffusion,
+        cond,
+        token_dim,
+        cfg_scale=cfg_scale,
+        temperature=temperature,
+        conditioning_timestep=conditioning_timestep,
+    )
+    loss, logs = compute_generator_dmd_loss_from_tokens(
+        x_gen,
+        fake_head,
+        teacher_head,
+        diffusion,
+        cond,
+        uncond_cond,
+        token_dim,
+        cfg_scale,
+        min_step,
+        max_step,
+    )
+    logs["conditioning_timestep"] = float(conditioning_timestep)
+    return loss, logs
+
+
+def compute_fake_loss_from_tokens(
+    fake_head,
+    diffusion,
+    fake_tokens: torch.Tensor,
+    cond: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    timesteps = torch.randint(
+        0,
+        diffusion.num_timesteps,
+        (fake_tokens.shape[0],),
+        device=fake_tokens.device,
+        dtype=torch.long,
+    )
+    loss_dict = diffusion.training_losses(fake_head, fake_tokens.float(), timesteps, model_kwargs={"c": cond.float()})
+    loss = loss_dict["loss"].mean()
+    logs = {
+        "loss_fake": float(loss.detach().item()),
+    }
+    return loss, logs
+
+
 def compute_fake_loss(
     generator_head,
     fake_head,
@@ -236,6 +371,7 @@ def compute_fake_loss(
     token_dim: int,
     cfg_scale: torch.Tensor,
     temperature: float = 1.0,
+    conditioning_timestep: int = DEFAULT_CONDITIONING_TIMESTEP,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     with torch.no_grad():
         x_gen = one_step_generate(
@@ -245,19 +381,76 @@ def compute_fake_loss(
             token_dim,
             cfg_scale=cfg_scale,
             temperature=temperature,
+            conditioning_timestep=conditioning_timestep,
         ).detach()
+    return compute_fake_loss_from_tokens(fake_head, diffusion, x_gen, cond)
 
-    timesteps = torch.randint(
-        0,
-        diffusion.num_timesteps,
-        (x_gen.shape[0],),
-        device=x_gen.device,
-        dtype=torch.long,
+
+def compute_generator_token_gan_loss(
+    fake_head,
+    gan_classifier,
+    diffusion,
+    fake_tokens: torch.Tensor,
+    cond: torch.Tensor,
+    diffusion_gan: bool = False,
+    diffusion_gan_max_timestep: int = 0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    fake_logits, timesteps = compute_token_gan_logits(
+        fake_head,
+        gan_classifier,
+        diffusion,
+        fake_tokens,
+        cond,
+        diffusion_gan=diffusion_gan,
+        diffusion_gan_max_timestep=diffusion_gan_max_timestep,
     )
-    loss_dict = diffusion.training_losses(fake_head, x_gen, timesteps, model_kwargs={"c": cond})
-    loss = loss_dict["loss"].mean()
+    loss = F.softplus(-fake_logits).mean()
     logs = {
-        "loss_fake": float(loss.detach().item()),
+        "gen_cls_loss": float(loss.detach().item()),
+        "gan_fake_prob_gen": float(torch.sigmoid(fake_logits.detach()).mean().item()),
+        "gan_fake_logit_gen": float(fake_logits.detach().mean().item()),
+        "gan_t_gen": float(timesteps.float().mean().item()),
+    }
+    return loss, logs
+
+
+def compute_guidance_token_gan_loss(
+    fake_head,
+    gan_classifier,
+    diffusion,
+    real_tokens: torch.Tensor,
+    fake_tokens: torch.Tensor,
+    cond: torch.Tensor,
+    diffusion_gan: bool = False,
+    diffusion_gan_max_timestep: int = 0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    real_logits, real_timesteps = compute_token_gan_logits(
+        fake_head,
+        gan_classifier,
+        diffusion,
+        real_tokens.detach(),
+        cond,
+        diffusion_gan=diffusion_gan,
+        diffusion_gan_max_timestep=diffusion_gan_max_timestep,
+    )
+    fake_logits, fake_timesteps = compute_token_gan_logits(
+        fake_head,
+        gan_classifier,
+        diffusion,
+        fake_tokens.detach(),
+        cond,
+        diffusion_gan=diffusion_gan,
+        diffusion_gan_max_timestep=diffusion_gan_max_timestep,
+    )
+    loss = F.softplus(fake_logits).mean() + F.softplus(-real_logits).mean()
+    logs = {
+        "guidance_cls_loss": float(loss.detach().item()),
+        "gan_real_prob": float(torch.sigmoid(real_logits.detach()).mean().item()),
+        "gan_fake_prob": float(torch.sigmoid(fake_logits.detach()).mean().item()),
+        "gan_real_logit": float(real_logits.detach().mean().item()),
+        "gan_fake_logit": float(fake_logits.detach().mean().item()),
+        "gan_t_real": float(real_timesteps.float().mean().item()),
+        "gan_t_fake": float(fake_timesteps.float().mean().item()),
     }
     return loss, logs
 
@@ -273,6 +466,7 @@ def sample_tokens_one_step(
     cfg: float = 3.0,
     cfg_schedule: str = "linear",
     temperature: float = 1.0,
+    conditioning_timestep: int = DEFAULT_CONDITIONING_TIMESTEP,
     progress: bool = False,
 ) -> torch.Tensor:
     if progress:
@@ -332,6 +526,7 @@ def sample_tokens_one_step(
             model.token_embed_dim,
             cfg_scale=cfg_scale,
             temperature=temperature,
+            conditioning_timestep=conditioning_timestep,
         )
         cur_tokens[mask_to_pred] = sampled_token_latent
         tokens = cur_tokens
