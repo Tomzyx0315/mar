@@ -5,8 +5,9 @@ It leaves the MAR teacher AR backbone frozen and trains only:
 
 - a one-step generator head initialized from the EMA teacher DiffLoss head
 - a fake diffusion head initialized from the same teacher head
-- optionally, one shared token-level GAN classifier attached to the fake
-  DiffLoss head hidden feature
+
+GAN training is currently disabled in this separate conditional/unconditional
+distillation path.
 
 The context distribution is teacher-forcing only: real VAE latents provide visible
 tokens, masked positions are dropped from the encoder, and losses are computed only
@@ -19,16 +20,25 @@ DMD2's SD default is usually too unstable for this DiffLoss head.
 
 ## Algorithm Notes
 
-The frozen teacher CFG score is computed in the usual MAR way:
+Conditional and unconditional routes are distilled separately. The shared
+generator and fake heads see either the class-conditional MAR decoder context or
+the null-class MAR decoder context, and each route is matched to the corresponding
+frozen teacher score without CFG during training:
 
 ```text
-eps_real = eps_uncond + cfg * (eps_cond - eps_uncond)
+loss_dm = 0.5 * (loss_dm_cond + loss_dm_uncond)
 ```
 
-The generator head receives the current `cfg_scale` through a zero-initialized
-CFG adapter, because the generated token distribution changes with CFG. The fake
-head does not receive CFG; it follows DMD2's `fake_guidance_scale == 1` setup and
-learns the score of the generator's current fake-token distribution.
+The fake head is trained on generated tokens from both routes with their matching
+contexts. CFG is used only during sampling. Conditional and unconditional
+generator predictions use the same input noise and are combined as:
+
+```text
+x0_cfg = x0_uncond + cfg * (x0_cond - x0_uncond)
+```
+
+Because the two routes share the same noise and conditioning timestep, this is
+equivalent to interpolating their epsilon predictions before converting to `x0`.
 
 DMD score computation is kept in fp32. This matters because the one-step
 generator predicts `x0` from a high-noise timestep, where half-precision error
@@ -37,20 +47,6 @@ can be amplified by the diffusion schedule.
 Training maintains an EMA copy of the generator head. Checkpoints save both
 `generator_head` and `generator_head_ema`; preview and sampling use EMA by
 default.
-
-With `--gan_classifier`, this folder follows DMD2's GAN-classifier design but at
-MAR token granularity. There is one shared classifier for all masked token
-positions, not one discriminator per position. The classifier sees fake-head
-hidden features for `(token, diffusion timestep, AR condition)` and is trained
-with logistic real/fake losses:
-
-```text
-G: softplus(-D(fake_token | cond))
-D: softplus(D(fake_token | cond)) + softplus(-D(real_token | cond))
-```
-
-`--diffusion_gan` matches DMD2's noisy-discriminator variant: real and fake
-tokens are noised at a random diffusion timestep before classification.
 
 ## Preparation
 
@@ -106,7 +102,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
   --vae_path pretrained_models/vae/kl16.ckpt \
   --data_path ${IMAGENET_PATH}/ILSVRC2012_img_train.tar \
   --tar_index_path ${IMAGENET_PATH}/ILSVRC2012_img_train.tar.index \
-  --output_dir output_mar_dmd/mar_large_cfg3_gan \
+  --output_dir output_mar_dmd/mar_large_separate_cfg \
   --batch_size 64 \
   --train_iters 100000 \
   --save_iters 2500 \
@@ -114,11 +110,6 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
   --fake_lr 2e-6 \
   --dfake_gen_update_ratio 5 \
   --dm_loss_weight 1.0 \
-  --gan_classifier \
-  --gen_cls_loss_weight 3e-3 \
-  --guidance_cls_loss_weight 1e-2 \
-  --diffusion_gan \
-  --diffusion_gan_max_timestep 1000 \
   --cfg 3.0 \
   --cfg_schedule linear \
   --conditioning_timestep 899 \
@@ -128,50 +119,25 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
   --preview_class_labels "207,360,388,113,355,980,323,979,88,130,279,291,340,386,805,954"
 ```
 
-MAR recommends different CFG scales for different teacher sizes, e.g. MAR-B
-uses `2.9`, MAR-L uses `3.0`, and MAR-H uses `3.2` in the official eval
-commands.
+`--cfg` and `--cfg_schedule` affect preview and sampling only; they do not affect
+the two-route DMD training loss. MAR recommends different sampling CFG scales for
+different teacher sizes, e.g. MAR-B uses `2.9`, MAR-L uses `3.0`, and MAR-H uses
+`3.2` in the official eval commands.
 
-## Token GAN Fine-Tune
+Rank 0 writes persistent training logs to:
 
-If you already have a good DMD-only checkpoint, resume from it and lower both
-learning rates.
+```text
+<output_dir>/log.txt                 # JSON Lines metrics
+<output_dir>/args.json               # resolved training arguments
+<output_dir>/tensorboard/events...   # TensorBoard events
+```
+
+Use `--log_dir` to override the TensorBoard directory. To inspect the default
+logs, run:
 
 ```bash
-torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
-  -m distill_dmd.train_mar_dmd \
-  --teacher_ckpt pretrained_models/mar/mar_large/checkpoint-last.pth \
-  --vae_path pretrained_models/vae/kl16.ckpt \
-  --data_path ${IMAGENET_PATH}/ILSVRC2012_img_train.tar \
-  --tar_index_path ${IMAGENET_PATH}/ILSVRC2012_img_train.tar.index \
-  --output_dir output_mar_dmd/mar_large_cfg3_gan \
-  --resume output_mar_dmd/mar_large_cfg3/checkpoint-last.pth \
-  --override_resume_lr \
-  --batch_size 64 \
-  --train_iters 150000 \
-  --save_iters 2500 \
-  --generator_lr 5e-7 \
-  --fake_lr 5e-7 \
-  --dfake_gen_update_ratio 5 \
-  --dm_loss_weight 1.0 \
-  --gan_classifier \
-  --gen_cls_loss_weight 3e-3 \
-  --guidance_cls_loss_weight 1e-2 \
-  --diffusion_gan \
-  --diffusion_gan_max_timestep 1000 \
-  --cfg 3.0 \
-  --cfg_schedule linear \
-  --conditioning_timestep 899 \
-  --generator_ema_rate 0.999 \
-  --preview_iters 1000 \
-  --preview_num_iter 256 \
-  --preview_class_labels "207,360,388,113,355,980,323,979,88,130,279,291,340,386,805,954"
+tensorboard --logdir output_mar_dmd/mar_large_separate_cfg/tensorboard
 ```
-
-When resuming, `--train_iters` is the final global step, not the number of extra
-GAN steps. Normal resume preserves the optimizer learning rates from the
-checkpoint; add `--override_resume_lr` when intentionally switching to the
-command-line learning rates for GAN fine-tuning.
 
 ## Resume
 
@@ -179,7 +145,7 @@ Use the same training command and add `--resume` pointing to the DMD checkpoint:
 
 ```bash
 # Add this to the train command above:
---resume output_mar_dmd/mar_large_cfg3/checkpoint-last.pth
+--resume output_mar_dmd/mar_large_separate_cfg/checkpoint-last.pth
 ```
 
 ## Sample
@@ -190,9 +156,9 @@ Sampling defaults to the CFG settings saved in the DMD checkpoint. It writes one
 ```bash
 python -m distill_dmd.sample_mar_dmd \
   --teacher_ckpt pretrained_models/mar/mar_large/checkpoint-last.pth \
-  --dmd_ckpt output_mar_dmd/mar_large_cfg3/checkpoint-last.pth \
+  --dmd_ckpt output_mar_dmd/mar_large_separate_cfg/checkpoint-last.pth \
   --vae_path pretrained_models/vae/kl16.ckpt \
-  --output output_mar_dmd/mar_large_cfg3/samples_50k.npz \
+  --output output_mar_dmd/mar_large_separate_cfg/samples_50k.npz \
   --num_images 50000 \
   --batch_size 64 \
   --num_iter 256 \
@@ -201,7 +167,7 @@ python -m distill_dmd.sample_mar_dmd \
   --conditioning_timestep 899
 ```
 
-Use `--save_png_dir output_mar_dmd/mar_large_cfg3/png_samples` only when you
+Use `--save_png_dir output_mar_dmd/mar_large_separate_cfg/png_samples` only when you
 also want individual PNG files.
 
 Set --num_iter to 256 for better fid result
@@ -214,9 +180,9 @@ The following script reuses the original MAR's fid evaluation
 torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
   -m distill_dmd.eval_one_ckpt_mar_fid \
   --teacher_ckpt pretrained_models/mar/mar_large/checkpoint-last.pth \
-  --dmd_ckpt output_mar_dmd/mar_large_cfg3/checkpoint-last.pth \
+  --dmd_ckpt output_mar_dmd/mar_large_separate_cfg/checkpoint-last.pth \
   --vae_path pretrained_models/vae/kl16.ckpt \
-  --output_dir output_mar_dmd/mar_large_cfg3/mar_fid \
+  --output_dir output_mar_dmd/mar_large_separate_cfg/mar_fid \
   --num_images 50000 \
   --batch_size 64 \
   --num_iter 256 \

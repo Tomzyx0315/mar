@@ -1,6 +1,7 @@
 import argparse
 import copy
 import datetime
+import json
 import os
 import time
 from pathlib import Path
@@ -12,18 +13,15 @@ import torch.backends.cudnn as cudnn
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
 
 from distill_dmd.tar_dataset import ImageNetTarDataset, MarTrainTransform
 from distill_dmd.mar_dmd import (
     DEFAULT_CONDITIONING_TIMESTEP,
-    compute_cfg_scale,
     compute_fake_loss_from_tokens,
     compute_generator_dmd_loss_from_tokens,
-    compute_generator_token_gan_loss,
-    compute_guidance_token_gan_loss,
     build_teacher_forcing_context,
     create_dmd_heads,
-    create_token_gan_classifier,
     one_step_generate,
     sample_tokens_one_step,
     unwrap_model,
@@ -38,6 +36,12 @@ def get_args_parser():
     parser = argparse.ArgumentParser("Distill MAR DiffLoss with DMD", add_help=False)
     parser.add_argument("--teacher_ckpt", required=True, type=str)
     parser.add_argument("--output_dir", default="./output_mar_dmd", type=str)
+    parser.add_argument(
+        "--log_dir",
+        default="",
+        type=str,
+        help="TensorBoard directory; defaults to <output_dir>/tensorboard",
+    )
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--override_resume_lr", action="store_true")
 
@@ -365,6 +369,23 @@ def set_optimizer_lr(optimizer, lr):
         group["lr"] = lr
 
 
+def reduce_log_value(value):
+    if isinstance(value, torch.Tensor):
+        value = value.detach().item()
+    return float(misc.all_reduce_mean(float(value)))
+
+
+def write_training_log(log_writer, output_dir, step, values):
+    if not misc.is_main_process():
+        return
+    for name, value in values.items():
+        if name not in {"step", "epoch", "elapsed_seconds"}:
+            log_writer.add_scalar(name, value, step)
+    log_writer.flush()
+    with open(os.path.join(output_dir, "log.txt"), "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(values, sort_keys=True) + "\n")
+
+
 def save_checkpoint(
     args,
     generator_head,
@@ -485,6 +506,12 @@ def main(args):
     misc.init_distributed_mode(args)
     device = torch.device(args.device)
 
+    if args.gan_classifier or args.diffusion_gan:
+        raise ValueError(
+            "GAN training is temporarily disabled while conditional and unconditional "
+            "DMD routes are distilled separately. Do not pass --gan_classifier or --diffusion_gan."
+        )
+
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -492,9 +519,19 @@ def main(args):
 
     teacher_ckpt = load_checkpoint(args.teacher_ckpt)
     args = fill_from_teacher_args(args, teacher_ckpt)
+    if not args.log_dir:
+        args.log_dir = os.path.join(args.output_dir, "tensorboard")
 
     if misc.is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(args.log_dir, exist_ok=True)
+        log_writer = SummaryWriter(log_dir=args.log_dir)
+        with open(os.path.join(args.output_dir, "args.json"), "w", encoding="utf-8") as handle:
+            json.dump(vars(args), handle, indent=2, sort_keys=True)
+        print(f"TensorBoard logs: {args.log_dir}")
+        print(f"JSONL training log: {os.path.join(args.output_dir, 'log.txt')}")
+    else:
+        log_writer = None
     print("{}".format(args).replace(", ", ",\n"))
 
     if args.data_path.endswith(".tar"):
@@ -531,7 +568,7 @@ def main(args):
 
     teacher_model = build_teacher_model(args, teacher_ckpt, device)
     generator_head, fake_head, teacher_head = create_dmd_heads(teacher_model)
-    gan_classifier = create_token_gan_classifier(teacher_model) if args.gan_classifier else None
+    gan_classifier = None
     generator_ema = copy.deepcopy(generator_head).to(device).eval()
     generator_ema.requires_grad_(False)
     generator_head.to(device).train()
@@ -582,54 +619,55 @@ def main(args):
                 )
             cond = context["cond"]
             uncond_cond = context["uncond_cond"]
-            cfg_scale = compute_cfg_scale(args.cfg, args.cfg_schedule, context["visible_fraction"])
-
             generator_logs = {}
-            x_fake = None
+            x_fake_cond = None
+            x_fake_uncond = None
             if step % args.dfake_gen_update_ratio == 0:
                 optimizer_generator.zero_grad(set_to_none=True)
                 fake_head_for_generator = unwrap_model(fake_head)
-                gan_classifier_for_generator = unwrap_model(gan_classifier) if gan_classifier is not None else None
                 set_requires_grad(fake_head_for_generator, False)
-                set_requires_grad(gan_classifier_for_generator, False)
-                x_gen = one_step_generate(
+                generator_conditions = torch.cat([cond, uncond_cond], dim=0)
+                x_gen_both = one_step_generate(
                     generator_head,
                     teacher_model.diffloss.train_diffusion,
-                    cond,
+                    generator_conditions,
                     teacher_model.token_embed_dim,
-                    cfg_scale,
                     temperature=args.temperature,
                     conditioning_timestep=args.conditioning_timestep,
                 )
+                x_gen_cond, x_gen_uncond = x_gen_both.chunk(2, dim=0)
                 try:
-                    loss_dm, generator_logs = compute_generator_dmd_loss_from_tokens(
-                        x_gen,
+                    loss_dm_cond, cond_logs = compute_generator_dmd_loss_from_tokens(
+                        x_gen_cond,
                         fake_head_for_generator,
                         teacher_head,
                         teacher_model.diffloss.train_diffusion,
                         cond,
-                        uncond_cond,
                         teacher_model.token_embed_dim,
-                        cfg_scale,
                         min_step,
                         max_step,
                     )
+                    loss_dm_uncond, uncond_logs = compute_generator_dmd_loss_from_tokens(
+                        x_gen_uncond,
+                        fake_head_for_generator,
+                        teacher_head,
+                        teacher_model.diffloss.train_diffusion,
+                        uncond_cond,
+                        teacher_model.token_embed_dim,
+                        min_step,
+                        max_step,
+                    )
+                    loss_dm = 0.5 * (loss_dm_cond + loss_dm_uncond)
                     generator_loss = loss_dm * args.dm_loss_weight
-                    if gan_classifier is not None and args.gen_cls_loss_weight > 0:
-                        loss_gen_cls, gen_cls_logs = compute_generator_token_gan_loss(
-                            fake_head_for_generator,
-                            gan_classifier_for_generator,
-                            teacher_model.diffloss.train_diffusion,
-                            x_gen,
-                            cond,
-                            diffusion_gan=args.diffusion_gan,
-                            diffusion_gan_max_timestep=args.diffusion_gan_max_timestep,
-                        )
-                        generator_loss = generator_loss + loss_gen_cls * args.gen_cls_loss_weight
-                        generator_logs.update(gen_cls_logs)
+                    generator_logs = {
+                        "loss_dm": float(loss_dm.detach().item()),
+                        "loss_dm_cond": float(loss_dm_cond.detach().item()),
+                        "loss_dm_uncond": float(loss_dm_uncond.detach().item()),
+                        "dm_grad_norm_cond": cond_logs["dm_grad_norm"],
+                        "dm_grad_norm_uncond": uncond_logs["dm_grad_norm"],
+                    }
                 finally:
                     set_requires_grad(fake_head_for_generator, True)
-                    set_requires_grad(gan_classifier_for_generator, True)
                 generator_logs["loss_generator_total"] = float(generator_loss.detach().item())
                 generator_logs["conditioning_timestep"] = float(args.conditioning_timestep)
                 scaler.scale(generator_loss).backward()
@@ -638,42 +676,33 @@ def main(args):
                 scaler.step(optimizer_generator)
                 scaler.update()
                 update_ema_model(generator_ema, generator_head, args.generator_ema_rate)
-                x_fake = x_gen.detach()
+                x_fake_cond = x_gen_cond.detach()
+                x_fake_uncond = x_gen_uncond.detach()
             else:
                 generator_grad_norm = torch.tensor(0.0, device=device)
 
             optimizer_fake.zero_grad(set_to_none=True)
-            if x_fake is None:
+            if x_fake_cond is None:
                 with torch.no_grad():
-                    x_fake = one_step_generate(
+                    fake_conditions = torch.cat([cond, uncond_cond], dim=0)
+                    x_fake_both = one_step_generate(
                         generator_head,
                         teacher_model.diffloss.train_diffusion,
-                        cond,
+                        fake_conditions,
                         teacher_model.token_embed_dim,
-                        cfg_scale,
                         temperature=args.temperature,
                         conditioning_timestep=args.conditioning_timestep,
                     ).detach()
+                    x_fake_cond, x_fake_uncond = x_fake_both.chunk(2, dim=0)
+            fake_tokens = torch.cat([x_fake_cond, x_fake_uncond], dim=0)
+            fake_conditions = torch.cat([cond, uncond_cond], dim=0)
             loss_fake, fake_logs = compute_fake_loss_from_tokens(
                 fake_head,
                 teacher_model.diffloss.train_diffusion,
-                x_fake,
-                cond,
+                fake_tokens,
+                fake_conditions,
             )
             fake_loss_total = loss_fake
-            if gan_classifier is not None and args.guidance_cls_loss_weight > 0:
-                loss_guidance_cls, guidance_cls_logs = compute_guidance_token_gan_loss(
-                    fake_head,
-                    gan_classifier,
-                    teacher_model.diffloss.train_diffusion,
-                    context["target"],
-                    x_fake,
-                    cond,
-                    diffusion_gan=args.diffusion_gan,
-                    diffusion_gan_max_timestep=args.diffusion_gan_max_timestep,
-                )
-                fake_loss_total = fake_loss_total + loss_guidance_cls * args.guidance_cls_loss_weight
-                fake_logs.update(guidance_cls_logs)
             fake_logs["loss_fake_total"] = float(fake_loss_total.detach().item())
             scaler.scale(fake_loss_total).backward()
             scaler.unscale_(optimizer_fake)
@@ -682,39 +711,45 @@ def main(args):
             scaler.update()
 
             if step % args.log_iters == 0:
-                loss_fake_value = misc.all_reduce_mean(fake_logs["loss_fake"])
+                log_values = {
+                    "step": int(step),
+                    "epoch": int(epoch),
+                    "elapsed_seconds": float(time.time() - start_time),
+                    "train/loss_fake": reduce_log_value(fake_logs["loss_fake"]),
+                    "train/loss_fake_total": reduce_log_value(fake_logs["loss_fake_total"]),
+                    "train/fake_grad_norm": reduce_log_value(fake_grad_norm),
+                    "train/fake_lr": float(optimizer_fake.param_groups[0]["lr"]),
+                    "train/generator_lr": float(optimizer_generator.param_groups[0]["lr"]),
+                }
+                loss_fake_value = log_values["train/loss_fake"]
                 msg = (
                     f"step {step}/{args.train_iters} "
                     f"loss_fake {loss_fake_value:.6f} "
-                    f"fake_grad {float(fake_grad_norm):.4f}"
+                    f"fake_grad {log_values['train/fake_grad_norm']:.4f}"
                 )
                 if generator_logs:
-                    loss_dm_value = misc.all_reduce_mean(generator_logs["loss_dm"])
+                    log_values.update({
+                        "train/loss_dm": reduce_log_value(generator_logs["loss_dm"]),
+                        "train/loss_dm_cond": reduce_log_value(generator_logs["loss_dm_cond"]),
+                        "train/loss_dm_uncond": reduce_log_value(generator_logs["loss_dm_uncond"]),
+                        "train/generator_loss_total": reduce_log_value(generator_logs["loss_generator_total"]),
+                        "train/generator_grad_norm": reduce_log_value(generator_grad_norm),
+                        "train/dm_grad_norm_cond": reduce_log_value(generator_logs["dm_grad_norm_cond"]),
+                        "train/dm_grad_norm_uncond": reduce_log_value(generator_logs["dm_grad_norm_uncond"]),
+                        "train/conditioning_timestep": float(args.conditioning_timestep),
+                    })
+                    loss_dm_value = log_values["train/loss_dm"]
                     msg += (
                         f" loss_dm {loss_dm_value:.6f}"
-                        f" gen_grad {float(generator_grad_norm):.4f}"
-                        f" cfg {generator_logs['cfg_scale']:.3f}"
+                        f" loss_dm_c {log_values['train/loss_dm_cond']:.6f}"
+                        f" loss_dm_u {log_values['train/loss_dm_uncond']:.6f}"
+                        f" gen_grad {log_values['train/generator_grad_norm']:.4f}"
                         f" cond_t {args.conditioning_timestep}"
-                        f" dm_grad {generator_logs['dm_grad_norm']:.4f}"
-                    )
-                    if "gen_cls_loss" in generator_logs:
-                        gen_cls_value = misc.all_reduce_mean(generator_logs["gen_cls_loss"])
-                        gen_total_value = misc.all_reduce_mean(generator_logs["loss_generator_total"])
-                        msg += (
-                            f" gen_cls {gen_cls_value:.6f}"
-                            f" gen_total {gen_total_value:.6f}"
-                            f" Dg_fake {generator_logs['gan_fake_prob_gen']:.3f}"
-                        )
-                if "guidance_cls_loss" in fake_logs:
-                    guidance_cls_value = misc.all_reduce_mean(fake_logs["guidance_cls_loss"])
-                    fake_total_value = misc.all_reduce_mean(fake_logs["loss_fake_total"])
-                    msg += (
-                        f" guidance_cls {guidance_cls_value:.6f}"
-                        f" fake_total {fake_total_value:.6f}"
-                        f" D_real {fake_logs['gan_real_prob']:.3f}"
-                        f" D_fake {fake_logs['gan_fake_prob']:.3f}"
+                        f" dm_grad_c {log_values['train/dm_grad_norm_cond']:.4f}"
+                        f" dm_grad_u {log_values['train/dm_grad_norm_uncond']:.4f}"
                     )
                 print(msg)
+                write_training_log(log_writer, args.output_dir, step, log_values)
 
             step += 1
             if step % args.save_iters == 0 or step == args.train_iters:
@@ -738,6 +773,8 @@ def main(args):
 
     total_time = str(datetime.timedelta(seconds=int(time.time() - start_time)))
     print(f"Training time {total_time}")
+    if log_writer is not None:
+        log_writer.close()
 
 
 if __name__ == "__main__":

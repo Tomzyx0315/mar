@@ -133,19 +133,27 @@ def one_step_generate(
     diffusion,
     cond: torch.Tensor,
     token_dim: int,
-    cfg_scale=None,
     temperature: float = 1.0,
     conditioning_timestep: int = DEFAULT_CONDITIONING_TIMESTEP,
+    noise: torch.Tensor = None,
 ) -> torch.Tensor:
     cond = cond.float()
-    noise = torch.randn(cond.shape[0], token_dim, device=cond.device, dtype=torch.float32) * temperature
+    if noise is None:
+        noise = torch.randn(cond.shape[0], token_dim, device=cond.device, dtype=torch.float32)
+        noise = noise * temperature
+    else:
+        if noise.shape != (cond.shape[0], token_dim):
+            raise ValueError(
+                f"noise must have shape {(cond.shape[0], token_dim)}, got {tuple(noise.shape)}"
+            )
+        noise = noise.to(device=cond.device, dtype=torch.float32)
     timesteps = torch.full(
         (cond.shape[0],),
         conditioning_timestep,
         device=cond.device,
         dtype=torch.long,
     )
-    model_output = generator_head(noise, timesteps, cond, cfg_scale=cfg_scale)
+    model_output = generator_head(noise, timesteps, cond)
     eps = extract_eps(model_output.float(), token_dim)
     return predict_xstart_from_eps(diffusion, noise, timesteps, eps)
 
@@ -221,9 +229,7 @@ def compute_generator_dmd_loss_from_tokens(
     teacher_head,
     diffusion,
     cond: torch.Tensor,
-    uncond_cond: torch.Tensor,
     token_dim: int,
-    cfg_scale: torch.Tensor,
     min_step: int,
     max_step: int,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -240,14 +246,8 @@ def compute_generator_dmd_loss_from_tokens(
     with torch.no_grad():
         x_t = x_t.float()
         cond = cond.float()
-        uncond_cond = uncond_cond.float()
         fake_eps = extract_eps(fake_head(x_t, timesteps, cond).float(), token_dim)
-        real_cond_eps = extract_eps(teacher_head(x_t, timesteps, cond).float(), token_dim)
-        if float(cfg_scale.detach().mean().item()) == 1.0:
-            real_eps = real_cond_eps
-        else:
-            real_uncond_eps = extract_eps(teacher_head(x_t, timesteps, uncond_cond).float(), token_dim)
-            real_eps = real_uncond_eps + cfg_scale * (real_cond_eps - real_uncond_eps)
+        real_eps = extract_eps(teacher_head(x_t, timesteps, cond).float(), token_dim)
 
         pred_fake_x0 = predict_xstart_from_eps(diffusion, x_t, timesteps, fake_eps)
         pred_real_x0 = predict_xstart_from_eps(diffusion, x_t, timesteps, real_eps)
@@ -263,7 +263,6 @@ def compute_generator_dmd_loss_from_tokens(
         "dm_grad_norm": float(torch.norm(grad.detach()).item()),
         "x_gen_mean": float(x_gen.detach().mean().item()),
         "x_gen_std": float(x_gen.detach().std().item()),
-        "cfg_scale": float(cfg_scale.detach().mean().item()),
     }
     return loss, logs
 
@@ -274,9 +273,7 @@ def compute_generator_dmd_loss(
     teacher_head,
     diffusion,
     cond: torch.Tensor,
-    uncond_cond: torch.Tensor,
     token_dim: int,
-    cfg_scale: torch.Tensor,
     min_step: int,
     max_step: int,
     temperature: float = 1.0,
@@ -287,7 +284,6 @@ def compute_generator_dmd_loss(
         diffusion,
         cond,
         token_dim,
-        cfg_scale=cfg_scale,
         temperature=temperature,
         conditioning_timestep=conditioning_timestep,
     )
@@ -297,9 +293,7 @@ def compute_generator_dmd_loss(
         teacher_head,
         diffusion,
         cond,
-        uncond_cond,
         token_dim,
-        cfg_scale,
         min_step,
         max_step,
     )
@@ -334,7 +328,6 @@ def compute_fake_loss(
     diffusion,
     cond: torch.Tensor,
     token_dim: int,
-    cfg_scale: torch.Tensor,
     temperature: float = 1.0,
     conditioning_timestep: int = DEFAULT_CONDITIONING_TIMESTEP,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -344,7 +337,6 @@ def compute_fake_loss(
             diffusion,
             cond,
             token_dim,
-            cfg_scale=cfg_scale,
             temperature=temperature,
             conditioning_timestep=conditioning_timestep,
         ).detach()
@@ -452,8 +444,9 @@ def sample_tokens_one_step(
         cur_tokens = tokens.clone()
         class_embedding = model.class_emb(labels)
 
-        x = model.forward_mae_encoder(tokens, mask, class_embedding)
-        z = model.forward_mae_decoder(x, mask)
+        context_mask = mask
+        x = model.forward_mae_encoder(tokens, context_mask, class_embedding)
+        z = model.forward_mae_decoder(x, context_mask)
 
         mask_ratio = math.cos(math.pi / 2.0 * (step + 1) / num_iter)
         mask_len = torch.tensor([math.floor(model.seq_len * mask_ratio)], device=labels.device)
@@ -484,15 +477,41 @@ def sample_tokens_one_step(
             dtype=cond.dtype,
         )
         cfg_scale = compute_cfg_scale(cfg, cfg_schedule, visible_fraction)
-        sampled_token_latent = one_step_generate(
-            generator_head,
-            diffusion,
-            cond,
-            model.token_embed_dim,
-            cfg_scale=cfg_scale,
-            temperature=temperature,
-            conditioning_timestep=conditioning_timestep,
-        )
+        if float(cfg_scale.item()) == 1.0:
+            sampled_token_latent = one_step_generate(
+                generator_head,
+                diffusion,
+                cond,
+                model.token_embed_dim,
+                temperature=temperature,
+                conditioning_timestep=conditioning_timestep,
+            )
+        else:
+            uncond_embedding = model.fake_latent.repeat(batch_size, 1)
+            uncond_x = model.forward_mae_encoder(tokens, context_mask, uncond_embedding)
+            uncond_z = model.forward_mae_decoder(uncond_x, context_mask)
+            uncond_cond = uncond_z[mask_to_pred]
+
+            shared_noise = torch.randn(
+                cond.shape[0],
+                model.token_embed_dim,
+                device=cond.device,
+                dtype=torch.float32,
+            ) * temperature
+            combined_cond = torch.cat([cond, uncond_cond], dim=0)
+            combined_noise = torch.cat([shared_noise, shared_noise], dim=0)
+            combined_token_latent = one_step_generate(
+                generator_head,
+                diffusion,
+                combined_cond,
+                model.token_embed_dim,
+                conditioning_timestep=conditioning_timestep,
+                noise=combined_noise,
+            )
+            cond_token_latent, uncond_token_latent = combined_token_latent.chunk(2, dim=0)
+            sampled_token_latent = uncond_token_latent + cfg_scale * (
+                cond_token_latent - uncond_token_latent
+            )
         cur_tokens[mask_to_pred] = sampled_token_latent
         tokens = cur_tokens
 

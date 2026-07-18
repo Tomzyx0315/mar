@@ -1,2 +1,4 @@
 __pycache__/
 eval_ckpt_fid.py
+pretrained_models
+AGENTS.md
